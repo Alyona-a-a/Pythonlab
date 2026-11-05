@@ -12,4 +12,4 @@ def type_check(*types):
 @type_check(int, int)
 def add(a, b):
     print(a + b)
-    add(2, 3)
+add(2, 3)
