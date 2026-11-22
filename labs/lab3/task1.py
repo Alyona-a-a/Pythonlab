@@ -2,159 +2,130 @@ import re
 import requests
 from bs4 import BeautifulSoup
 
-SECTION_URL = "https://afisha.relax.by/theatre/minsk/"
-OUTPUT_FILE = "theatre_events.txt"
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-}
+URL = "https://afisha.relax.by/theatre/minsk/"
+OUT = "theatre_events.txt"
+HEADERS = {"User-Agent": "Mozilla/5.0"}
+
+MONTHS = [
+    "января", "февраля", "марта", "апреля", "мая", "июня",
+    "июля", "августа", "сентября", "октября", "ноября", "декабря",
+]
 
 
-def fetch_soup(url: str) -> BeautifulSoup:
-    resp = requests.get(url, headers=HEADERS, timeout=15)
-    resp.raise_for_status()
-    return BeautifulSoup(resp.text, "html.parser")
-
-
-def clean(text: str) -> str:
-    text = text.replace("\u200e", "").replace("\u200f", "").replace("\xa0", " ")
+def clean(text):
+    text = text.replace("\u200e", "").replace("\xa0", " ")
     return " ".join(text.split())
 
 
-def extract_prices(text: str) -> list[float]:
-    found = []
-    for m in re.findall(r"(\d+(?:[.,]\d+)?)\s*(?:руб|р\.|byn)", text.lower()):
-        val = float(m.replace(",", "."))
-        if 1 <= val <= 5000:
-            found.append(val)
-    return found
+def get_soup(url):
+    r = requests.get(url, headers=HEADERS, timeout=15)
+    r.raise_for_status()
+    return BeautifulSoup(r.text, "html.parser")
 
 
-def detect_venue(soup: BeautifulSoup) -> str:
-    bad_words = [
-        "сегодня", "завтра", "понедельник", "вторник", "среда",
-        "четверг", "пятница", "суббота", "воскресенье", "билеты", "афиша",
-    ]
-    bad_prefixes = ("вс,", "ср,", "чт,", "пт,", "сб,", "пн,", "вт,")
-    for el in soup.find_all(["a", "span", "div"]):
-        t = clean(el.get_text())
-        low = t.lower()
-        if any(b in low for b in bad_words) or low.startswith(bad_prefixes):
-            continue
-        if any(k in low for k in ["театр", "дворец", "центр", "дом культуры", "сцена", "филармония"]):
-            if 5 <= len(t) <= 70:
-                return t
+def find_date(text):
+    words = text.lower().split()
+    for i, w in enumerate(words):
+        if w in MONTHS and i > 0 and words[i - 1].isdigit():
+            day = words[i - 1]
+            if 1 <= int(day) <= 31:
+                if i + 1 < len(words) and ":" in words[i + 1]:
+                    return f"{day} {w} {words[i + 1]}"
+                return f"{day} {w}"
     return "не указано"
 
 
-def parse_event_page(url: str) -> dict:
-    soup = fetch_soup(url)
-    page_text = clean(soup.get_text(" ", strip=True))
+def parse_event(url):
+    soup = get_soup(url)
+    text = clean(soup.get_text(" ", strip=True))
 
     h1 = soup.find("h1")
-    title = clean(h1.get_text()) if h1 else ""
+    title = clean(h1.get_text()) if h1 else "Без названия"
 
-    age_match = re.search(r"\b(0\+|6\+|12\+|16\+|18\+)\b", page_text)
-    age = age_match.group(1) if age_match else "не указано"
+    age = "не указано"
+    for a in ["0+", "6+", "12+", "16+", "18+"]:
+        if f" {a} " in f" {text} ":
+            age = a
+            break
 
-    date_match = re.search(
-        r"\b\d{1,2}\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)(?:\s+\d{4})?(?:\s*,?\s*\d{1,2}:\d{2})?\b",
-        page_text.lower(),
-    )
-    dt = date_match.group(0) if date_match else "не указано"
+    dt = find_date(text)
 
-    venue = detect_venue(soup)
-    prices = extract_prices(page_text)
-    min_p = min(prices) if prices else None
-    max_p = max(prices) if prices else None
+    venue = "не указано"
+    for tag in soup.find_all(["a", "span", "div"]):
+        t = clean(tag.get_text())
+        low = t.lower()
+        if any(w in low for w in ["театр", "дворец", "центр", "сцена", "филармония"]) and 5 <= len(t) <= 60:
+            if not any(bad in low for bad in ["сегодня", "завтра", "билеты", "унп"]):
+                venue = t
+                break
+
+    prices = [
+        float(p.replace(",", "."))
+        for p in re.findall(r"(\d+(?:[.,]\d+)?)\s*(?:руб|р\.|byn)", text.lower())
+        if 1 <= float(p.replace(",", ".")) <= 5000
+    ]
 
     return {
         "title": title,
         "dt": dt,
         "venue": venue,
-        "min_price": min_p,
-        "max_price": max_p,
         "age": age,
-        "url": url,
+        "price": min(prices) if prices else None,
+        "max_price": max(prices) if prices else None,
     }
 
 
-def collect_events(section_url: str, limit: int = 15) -> list[dict]:
-    soup = fetch_soup(section_url)
+def main():
+    soup = get_soup(URL)
     links = []
-    seen = set()
-
     for a in soup.find_all("a", href=True):
         href = a["href"].strip()
-        if "/theatre/" in href and re.search(r"/\d{4,}", href):
-            if href not in seen:
-                seen.add(href)
-                links.append(href)
-        if len(links) >= limit:
+        if "/theatre/" in href and re.search(r"/\d{4,}", href) and href not in links:
+            links.append(href)
+        if len(links) == 15:
             break
 
     events = []
     for link in links:
         try:
-            item = parse_event_page(link)
-            if item["title"]:
-                events.append(item)
+            events.append(parse_event(link))
         except Exception:
-            continue
-    return events
+            pass
 
+    all_prices = [e["price"] for e in events if e["price"] is not None] + [
+        e["max_price"] for e in events if e["max_price"] is not None
+    ]
+    min_p = min(all_prices) if all_prices else 0
+    max_p = max(all_prices) if all_prices else 0
+    avg_p = round(sum(all_prices) / len(all_prices), 2) if all_prices else 0
 
-def build_report(events: list[dict]) -> str:
-    all_prices = []
     venues = {}
-    cheapest = None
-    priciest = None
+    for e in events:
+        if e["venue"] != "не указано":
+            venues[e["venue"]] = venues.get(e["venue"], 0) + 1
+    top_venue = max(venues, key=venues.get) if venues else "не указано"
 
-    for ev in events:
-        v = ev["venue"]
-        if v != "не указано":
-            venues[v] = venues.get(v, 0) + 1
-        if ev["min_price"] is not None:
-            all_prices.append(ev["min_price"])
-            if cheapest is None or ev["min_price"] < cheapest["min_price"]:
-                cheapest = ev
-        if ev["max_price"] is not None:
-            all_prices.append(ev["max_price"])
-            if priciest is None or ev["max_price"] > priciest["max_price"]:
-                priciest = ev
-
-    top_venue = max(venues.items(), key=lambda x: x[1])[0] if venues else "не определена"
-    min_price = min(all_prices) if all_prices else 0
-    max_price = max(all_prices) if all_prices else 0
-    avg_price = round(sum(all_prices) / len(all_prices), 2) if all_prices else 0
+    with_price = [e for e in events if e["price"] is not None]
+    cheapest = min(with_price, key=lambda e: e["price"]) if with_price else None
+    priciest = max(with_price, key=lambda e: e["max_price"] or e["price"]) if with_price else None
 
     lines = [
-        f"Раздел: {SECTION_URL}",
-        f"Событий обработано: {len(events)}",
-        f"Мин. цена билета: {min_price}",
-        f"Макс. цена билета: {max_price}",
-        f"Средняя цена билета: {avg_price}",
+        f"Раздел: {URL}",
+        f"Событий: {len(events)}",
+        f"Мин. цена: {min_p} | Макс. цена: {max_p} | Средняя цена: {avg_p}",
         f"Самая загруженная площадка: {top_venue}",
-        f"Самый дешёвый билет: {cheapest['title']} ({cheapest['min_price']})" if cheapest else "Самый дешёвый билет: нет данных",
-        f"Самый дорогой билет: {priciest['title']} ({priciest['max_price']})" if priciest else "Самый дорогой билет: нет данных",
+        f"Самый дешёвый: {cheapest['title']} ({cheapest['price']})" if cheapest else "Самый дешёвый: нет данных",
+        f"Самый дорогой: {priciest['title']} ({priciest['max_price'] or priciest['price']})" if priciest else "Самый дорогой: нет данных",
         "",
     ]
+    for i, e in enumerate(events, 1):
+        p_str = str(e["price"]) if e["price"] is not None else "не указана"
+        lines.append(f"{i}. {e['title']} | {e['dt']} | {e['venue']} | Цена: {p_str} | {e['age']}")
 
-    for i, ev in enumerate(events, 1):
-        price_str = f"{ev['min_price']}..{ev['max_price']}" if ev["min_price"] is not None else "не указана"
-        lines.append(
-            f"{i}. {ev['title']} | Дата/время: {ev['dt']} | Место: {ev['venue']} | "
-            f"Цена: {price_str} | Возраст: {ev['age']}"
-        )
+    with open(OUT, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
 
-    return "\n".join(lines) + "\n"
-
-
-def main() -> None:
-    events = collect_events(SECTION_URL)
-    report = build_report(events)
-    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
-        f.write(report)
-    print(f"Готово. Сохранено в {OUTPUT_FILE}, событий: {len(events)}")
+    print("Готово:", OUT)
 
 
 if __name__ == "__main__":
